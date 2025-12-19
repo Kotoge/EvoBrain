@@ -902,78 +902,86 @@ class EvoBrain(nn.Module):
         return weights
     
     def forward(self, inputs, supports):
-        # inputs: (T, B, N, D)
-        T, B, N, D = inputs.shape
-
-        # ----- 1. Node SNN -----
-        x = inputs.reshape(T, B * N, D)
-
-        if self.reduce_node == "mamba":
-            x = x.permute(1, 0, 2)
-            x = self.snn_node(x).permute(1, 0, 2)
+        timestep, b, node, dim = inputs.shape
+        inputs = inputs.reshape(timestep, b*node, dim)
+        
+        if self.reduce_node == "mingru" or self.reduce_node == "mamba":
+            inputs = inputs.permute(1, 0, 2)
+            node_embeds = self.snn_node.forward(inputs)
+            node_embeds =  node_embeds.permute(1, 0, 2)
         else:
-            x, _ = self.snn_node(x)
+            node_embeds, _ = self.snn_node.forward(inputs)
+        node_embeds = node_embeds.reshape(timestep, b, node, dim)
 
-        node_embeds = x.reshape(T, B, N, D)
-
-        # ----- 2. Edge features -----
         if supports.shape[2] == 1:
-            supports = supports.squeeze(2)
-
+            supports = torch.squeeze(supports, dim=2)
         edge_tuples, edge_features = self.create_edge_tuples_and_features(supports)
-        # edge_tuples: (2, E)
-        # edge_features: (T * B * E, 1)
 
-        edge_features = edge_features.reshape(T, B, -1, 1)
+        edge_features = edge_features.reshape(timestep, -1, 1)
 
-        if self.reduce_edge == "mingru":
-            ef = edge_features.permute(1, 0, 2, 3)  # (B, T, E, 1)
-            ef = ef.reshape(B, T * self.num_edges, 1)
-            ef = self.snn_edge(ef)
-            ef = ef.reshape(B, T, self.num_edges, D).permute(1, 0, 2, 3)
+        if self.reduce_edge == "mingru" or self.reduce_edge == "mamba":
+            edge_features =  edge_features.permute(1, 0, 2)
+            edge_embeds = self.snn_edge.forward(edge_features)
+            edge_embeds =  edge_embeds.permute(1, 0, 2)
         else:
-            ef = edge_features.reshape(T * B * self.num_edges, 1)
-            ef, _ = self.snn_edge(ef)
-            ef = ef.reshape(T, B, self.num_edges, D)
+            edge_embeds, _ = self.snn_edge.forward(edge_features)
+        edge_embeds = edge_embeds.reshape(timestep, b, -1, dim)
 
-        edge_embeds = ef
+        all_node_embeds = node_embeds
+        all_edge_embeds = edge_embeds
 
-        # ----- 3. Batch edge_index construction -----
-        # edge_index_base: (2, E)
-        edge_index_base = edge_tuples.to(inputs.device)
+        device = next(self.parameters()).device
 
+        edge_tuples = edge_tuples.to(device)
+
+        node_last = all_node_embeds[-1].to(device)   # [b, node, dim]
+        edge_last = all_edge_embeds[-1].to(device)   # [b, E, dim]
+        edge_weights = self.edge_activate(self.edge_transform(edge_last))  # [b, E, 1]
+
+        node_with_pe_list = []
         edge_index_list = []
-        for b in range(B):
-            offset = b * N
-            ei = edge_index_base + offset
-            edge_index_list.append(ei)
+        edge_weight_list = []
 
-        batch_edge_index = torch.cat(edge_index_list, dim=1)   # (2, B*E)
+        for i in range(b):
+            ew = edge_weights[i]
+            ew = ew / (ew.max() + 1e-6)
 
-        # ----- 4. Get last time step embeddings -----
-        node_last = node_embeds[-1]              # (B, N, D)
-        edge_last = edge_embeds[-1]              # (B, E, D)
+            data = Data(
+                x=node_last[i],
+                edge_index=edge_tuples,
+                edge_weight=ew.squeeze(-1)
+            )
 
-        # ----- 5. Batch node features -----
-        x = node_last.reshape(B * N, D)          # (B*N, D)
+            if self.num_eigenvectors > 0:
+                data = self.laplacian_pe(data.detach())
+                pe = data.laplacian_eigenvector_pe.to(device)
+                x_i = torch.cat([node_last[i], pe], dim=-1)
+            else:
+                x_i = node_last[i]
 
-        # ----- 6. Batch edge weights -----
-        edge_w = self.edge_activate(
-            self.edge_transform(edge_last)
-        )   # (B, E, 1)
+            node_with_pe_list.append(x_i)
+            
+            edge_index_list.append(edge_tuples + i * node)
+            edge_weight_list.append(edge_weights[i].squeeze(-1))
 
-        edge_w = edge_w.reshape(B * self.num_edges)  # (B*E,)
+        # [b, node, dim(+k)]
+        node_with_pe = torch.stack(node_with_pe_list, dim=0)
 
-        # ----- 7. GNN forward -----
-        x_out = self.gnnx2(
-            batch_edge_index,
-            edge_w,
-            self.activate(x)
-        )   # (B*N, out_dim)
+        x = self.activate(node_with_pe)
+        x = x.view(b * node_last.size(1), -1)
 
-        # ----- 8. Reshape back -----
-        x_out = x_out.reshape(B, N, -1)
-        return x_out
+        edge_index = torch.cat(edge_index_list, dim=1)   # [2, b*E]
+        edge_weight = torch.cat(edge_weight_list, dim=0) # [b*E]
+
+        out = self.gnnx2.forward(
+            edge_index,
+            edge_weight,
+            x
+        )
+
+        outputs = out.view(b, node_last.size(1), -1)
+        return outputs
+
 
     
     def create_edge_tuples_and_features(self, adj):
@@ -1011,7 +1019,7 @@ class EvoBrain_classification(nn.Module):
         self.num_classes = num_classes
         self.device = device
         
-        self.gru_gcn = EvoBrain(feat_input_size_edge=args.input_dim, 
+        self.evobrain = EvoBrain(feat_input_size_edge=args.input_dim, 
                                feat_input_size_node=args.input_dim,
                                feat_target_size=args.rnn_units, 
                                embed_inside_size=args.input_dim,
@@ -1025,9 +1033,9 @@ class EvoBrain_classification(nn.Module):
                                 num_eigenvectors=num_eigenvectors
                                )
         if args.agg != "concat":
-            self.fc = nn.Linear(self.gru_gcn.feat_target_size + num_eigenvectors, num_classes)
+            self.fc = nn.Linear(self.evobrain.feat_target_size + num_eigenvectors, num_classes)
         else:
-            self.fc = nn.Linear(self.gru_gcn.feat_target_size * self.num_nodes, num_classes)
+            self.fc = nn.Linear(self.evobrain.feat_target_size * self.num_nodes, num_classes)
         self.dropout = nn.Dropout(args.dropout)
         self.relu = nn.ReLU()
         self.agg = args.agg
@@ -1047,7 +1055,7 @@ class EvoBrain_classification(nn.Module):
         # (max_seq_len, batch, num_nodes, input_dim)
         input_seq = torch.transpose(input_seq, dim0=0, dim1=1)
         
-        final_hidden = self.gru_gcn(input_seq, adj)
+        final_hidden = self.evobrain(input_seq, adj)
         if self.agg == "concat":
             final_hidden = final_hidden.view(batch_size, -1)  # (batch_size, num_nodes * num_features)
         logits = self.fc(self.relu(self.dropout(final_hidden)))
