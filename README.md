@@ -4,8 +4,10 @@
 ---
 ## Data
 
-Temple University Seizure Corpus (TUSZ) v1.5.2 dataset is publicly available [here](https://isip.piconepress.com/projects/tuh_eeg/).
-Once your request form is accepted, you can access the dataset.
+Temple University Seizure Corpus (TUSZ) dataset is publicly available [here](https://isip.piconepress.com/projects/tuh_eeg/).
+
+**However, the distribution of v1.5.2 has been discontinued.**
+Please use a newer version of the dataset or try other EEG datasets instead.
 
 ---
 
